@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>故障规程静默跳转复核 · 弱互模拟审计</title>
+<style>
+  :root {
+    --bg:#0f1419; --panel:#171d24; --line:#2a333d; --fg:#d7dee5;
+    --muted:#8b98a5; --ok:#3fb96f; --bad:#e05c5c; --accent:#5aa0ef; --warn:#e0a85c;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+    font:14px/1.55 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
+  header { padding:18px 24px; border-bottom:1px solid var(--line); }
+  header h1 { margin:0 0 4px; font-size:18px; }
+  header p { margin:0; color:var(--muted); font-size:13px; }
+  main { max-width:1180px; margin:0 auto; padding:20px 24px 60px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px 16px; }
+  .card h2 { margin:0 0 8px; font-size:15px; }
+  textarea { width:100%; min-height:300px; resize:vertical; background:#0b1016; color:var(--fg);
+    border:1px solid var(--line); border-radius:6px; padding:10px; font:12px/1.5 ui-monospace,Menlo,Consolas,monospace; }
+  .toolbar { display:flex; gap:10px; align-items:center; margin:16px 0; flex-wrap:wrap; }
+  button { background:var(--accent); color:#08111c; border:0; border-radius:6px;
+    padding:8px 18px; font-weight:600; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--accent); border:1px solid var(--accent); font-weight:500; }
+  button:hover { filter:brightness(1.1); }
+  .verdict { border-radius:8px; padding:14px 18px; margin:16px 0; border:1px solid; font-size:15px; }
+  .verdict.ok  { border-color:var(--ok);  background:rgba(63,185,111,.08); }
+  .verdict.bad { border-color:var(--bad); background:rgba(224,92,92,.08); }
+  .verdict .big { font-size:17px; font-weight:700; margin-bottom:4px; }
+  .ok .big { color:var(--ok); } .bad .big { color:var(--bad); }
+  .muted { color:var(--muted); }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th,td { border:1px solid var(--line); padding:6px 10px; text-align:left; }
+  th { background:#10161d; color:var(--muted); font-weight:600; }
+  code { background:#0b1016; border:1px solid var(--line); border-radius:4px; padding:1px 5px;
+    font-family:ui-monospace,Menlo,Consolas,monospace; }
+  details { margin:8px 0; }
+  details > summary { cursor:pointer; color:var(--accent); user-select:none; }
+  .tag { display:inline-block; border-radius:4px; padding:0 7px; font-size:12px; margin-right:6px; }
+  .tag.tau { background:#33414e; color:#9fb6c8; }
+  .tag.obs { background:#27384d; color:#9cc3f0; }
+  .tag.round { background:#3a2f1a; color:var(--warn); }
+  .tag.elim { background:#3d2323; color:var(--bad); }
+  .tag.alive { background:#1e3a2a; color:var(--ok); }
+  .errbox { border:1px solid var(--bad); background:rgba(224,92,92,.08); border-radius:8px; padding:12px 16px; }
+  .errbox li { margin:3px 0; }
+  .hidden { display:none; }
+  .chiprow { display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; }
+  .round-head { display:flex; gap:10px; align-items:center; }
+  .cand-none { color:var(--bad); }
+  .footer-note { color:var(--muted); font-size:12px; margin-top:24px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>卫星地面站 · 故障规程静默跳转复核</h1>
+  <p>录入两份规程（有限状态 / 初始状态 / 迁移），审计两侧初始状态是否维持相同的可观察承诺（弱互模拟，<code>⇒τ·a·⇒τ</code>）。</p>
+</header>
+<main>
+  <div class="grid">
+    <section class="card">
+      <h2>规程 A（JSON）</h2>
+      <textarea id="inputA" spellcheck="false"></textarea>
+    </section>
+    <section class="card">
+      <h2>规程 B（JSON）</h2>
+      <textarea id="inputB" spellcheck="false"></textarea>
+    </section>
+  </div>
+
+  <div class="toolbar">
+    <button id="btnAudit">提交审计</button>
+    <button class="ghost" id="btnExampleEq">载入：tau 环等价示例</button>
+    <button class="ghost" id="btnExampleNeq">载入：缺失匹配动作示例</button>
+    <span class="muted">约束：每规程 ≤ 18 个状态、≤ 4 种可观察 ASCII 动作，另含静默动作 <code>tau</code>；状态与迁移标识唯一。</span>
+  </div>
+
+  <div id="errors" class="errbox hidden"></div>
+  <div id="result"></div>
+
+  <p class="footer-note">
+    算法：R0 为笛卡尔积；每轮以开轮关系 R<sub>r-1</sub> 同步检验全部状态对，失败者本轮一并淘汰；无淘汰即不动点。
+    每条失败义务的候选对必在更早轮次淘汰（或无任何候选），证据按状态对、动作、候选稳定排序，可自底向上逐轮复算。
+  </p>
+</main>
+
+<script>
+"use strict";
+
+const EXAMPLES = {
+  eq: {
+    a: {
+      label: "A",
+      states: ["S0", "S1", "S2"],
+      initial: "S0",
+      actions: ["alarm", "reset"],
+      transitions: [
+        { id: "a1", source: "S0", action: "tau",   target: "S1" },
+        { id: "a2", source: "S1", action: "tau",   target: "S0" },
+        { id: "a3", source: "S1", action: "alarm", target: "S2" },
+        { id: "a4", source: "S2", action: "reset", target: "S0" }
+      ]
+    },
+    b: {
+      label: "B",
+      states: ["T0", "T1", "T2"],
+      initial: "T0",
+      actions: ["alarm", "reset"],
+      transitions: [
+        { id: "b1", source: "T0", action: "tau",   target: "T1" },
+        { id: "b2", source: "T1", action: "tau",   target: "T0" },
+        { id: "b3", source: "T0", action: "alarm", target: "T2" },
+        { id: "b4", source: "T2", action: "reset", target: "T0" }
+      ]
+    }
+  },
+  neq: {
+    a: {
+      label: "A",
+      states: ["S0", "S1"],
+      initial: "S0",
+      actions: ["alarm"],
+      transitions: [
+        { id: "a1", source: "S0", action: "tau",   target: "S1" },
+        { id: "a2", source: "S1", action: "alarm", target: "S0" }
+      ]
+    },
+    b: {
+      label: "B",
+      states: ["T0"],
+      initial: "T0",
+      actions: ["alarm"],
+      transitions: [
+        { id: "b1", source: "T0", action: "tau", target: "T0" }
+      ]
+    }
+  }
+};
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function loadExample(name) {
+  const ex = EXAMPLES[name];
+  document.getElementById("inputA").value = JSON.stringify(ex.a, null, 2);
+  document.getElementById("inputB").value = JSON.stringify(ex.b, null, 2);
+  clearConclusion();
+}
+
+function clearConclusion() {
+  document.getElementById("result").innerHTML = "";
+  document.getElementById("errors").classList.add("hidden");
+}
+
+function actionTag(a) {
+  return a === "tau"
+    ? '<span class="tag tau">tau（静默）</span>'
+    : '<span class="tag obs">可观察 · ' + esc(a) + "</span>";
+}
+
+function renderCandidates(f) {
+  if (!f.has_response || f.candidates.length === 0) {
+    return '<div class="cand-none">对方以静默前缀后无可承接此动作的状态（无候选）。</div>';
+  }
+  let html = '<div class="muted" style="margin:4px 0">候选响应（稳定排序；全部已在更早轮次淘汰）：</div><table>'
+    + "<tr><th>候选状态对</th><th>静默/动作见证迁移</th><th>淘汰依据</th></tr>";
+  for (const c of f.candidates) {
+    html += "<tr><td><code>(" + esc(c.pair[0]) + ", " + esc(c.pair[1]) + ")</code></td>"
+      + "<td>" + (c.witness.length ? c.witness.map(esc).join(" → ") : '<span class="muted">零步</span>') + "</td>"
+      + '<td><span class="tag elim">第 ' + (c.eliminated_round ?? "?") + " 轮淘汰</span></td></tr>";
+  }
+  return html + "</table>";
+}
+
+function renderFailure(f) {
+  const dirText = f.direction === "A->B"
+    ? "A → B：A 的迁移 <code>" + esc(f.transition_id) + "</code>（" + esc(f.challenge[0]) + " → " + esc(f.challenge[1]) + "）"
+    : "B → A：B 的迁移 <code>" + esc(f.transition_id) + "</code>（" + esc(f.challenge[0]) + " → " + esc(f.challenge[1]) + "）";
+  return '<details><summary>' + dirText + " " + actionTag(f.action) + "</summary>"
+    + '<div style="margin:8px 0 8px 14px">' + renderCandidates(f) + "</div></details>";
+}
+
+function renderEliminated(entry) {
+  let html = '<div style="margin:6px 0">状态对 <code>(' + esc(entry.pair[0]) + ", " + esc(entry.pair[1])
+    + ')</code> 于第 1 轮淘汰，失败义务 ' + entry.failures.length + " 条：</div>";
+  for (const f of entry.failures) html += renderFailure(f);
+  return html;
+}
+
+function renderReport(report) {
+  const eq = report.equivalent;
+  let html = '<div class="verdict ' + (eq ? "ok" : "bad") + '">'
+    + '<div class="big">' + (eq ? "✔ 两规程等价" : "✘ 两规程不等价") + "</div>"
+    + '<div>' + (eq
+      ? "两个初始状态维持相同的可观察承诺；初始状态对在最终关系中存活。"
+      : "存在可观察承诺无法由另一侧以静默前缀后承接同动作；初始状态对被淘汰。") + "</div></div>";
+
+  html += '<section class="card"><h2>初始状态对（关系中须同时包含两个方向）</h2><table>'
+    + "<tr><th>初始状态对</th><th>结论</th><th>淘汰轮次</th></tr>";
+  for (const ip of report.initial_pairs) {
+    html += "<tr><td><code>(" + esc(ip.pair[0]) + ", " + esc(ip.pair[1]) + ")</code></td>"
+      + "<td>" + (ip.survives
+        ? '<span class="tag alive">存活于 R∞</span>'
+        : '<span class="tag elim">淘汰</span>') + "</td>"
+      + "<td>" + (ip.eliminated_round == null ? "—" : "第 " + ip.eliminated_round + " 轮") + "</td></tr>";
+  }
+  html += "</table>"
+    + '<div class="chiprow"><span class="muted">可观察动作并集：</span>'
+    + report.observable_actions.union.map(a => "<code>" + esc(a) + "</code>").join(" ")
+    + "</div>"
+    + '<div class="muted" style="margin-top:6px">总淘汰轮次：' + report.total_rounds
+    + "；状态对总数：" + report.state_pair_count
+    + "；不动点存活对数：" + report.survivors.length + "</div></section>";
+
+  if (!eq && report.first_eliminated) {
+    const fe = report.first_eliminated;
+    html += '<section class="card" style="margin-top:16px"><h2>首个淘汰状态对（审查员可展开）</h2>'
+      + '<div class="round-head"><span class="tag round">第 ' + fe.round + " 轮</span>"
+      + '<span>状态对 <code>(' + esc(fe.pair[0]) + ", " + esc(fe.pair[1]) + ")</code></span>"
+      + '<span class="muted">挑战动作（稳定排序）：</span>'
+      + fe.challenge_actions.map(actionTag).join("") + "</div>"
+      + '<div style="margin-top:8px">' + renderEliminated(fe) + "</div></section>";
+  }
+
+  if (report.rounds.length) {
+    html += '<section class="card" style="margin-top:16px"><h2>按轮次递减的淘汰依据</h2>';
+    for (const rd of report.rounds) {
+      html += '<details><summary><span class="tag round">第 ' + rd.round + " 轮</span>"
+        + "淘汰 " + rd.eliminated.length + " 个状态对"
+        + '<span class="muted">（每条义务仅引用第 1..' + (rd.round - 1) + " 轮的淘汰结果）</span></summary>";
+      for (const e of rd.eliminated) {
+        html += '<div style="margin:10px 0 10px 12px"><b><code>(' + esc(e.pair[0]) + ", " + esc(e.pair[1])
+          + ")</code></b>";
+        for (const f of e.failures) html += renderFailure(f);
+        html += "</div>";
+      }
+      html += "</details>";
+    }
+    html += "</section>";
+  }
+
+  html += '<section class="card" style="margin-top:16px"><h2>不动点 R∞ 存活状态对</h2><div class="chiprow">'
+    + (report.survivors.length
+      ? report.survivors.map(p => "<code>(" + esc(p[0]) + ", " + esc(p[1]) + ")</code>").join(" ")
+      : '<span class="muted">无</span>')
+    + "</div></section>";
+
+  document.getElementById("result").innerHTML = html;
+}
+
+async function submitAudit() {
+  clearConclusion();
+  const resp = await fetch("/api/audit", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      a: document.getElementById("inputA").value,
+      b: document.getElementById("inputB").value
+    })
+  });
+  let data;
+  try { data = await resp.json(); }
+  catch { data = { error: "服务响应无法解析" }; }
+
+  if (data.valid === false) {
+    const box = document.getElementById("errors");
+    box.classList.remove("hidden");
+    box.innerHTML = "<b>输入无效，旧结论已清除（一次列出全部问题）：</b><ul>"
+      + data.problems.map(p => "<li>[规程 " + esc(p.procedure) + "] <code>" + esc(p.where)
+      + "</code>：" + esc(p.message) + "</li>").join("") + "</ul>";
+    return;
+  }
+  if (data.error || !data.report) {
+    const box = document.getElementById("errors");
+    box.classList.remove("hidden");
+    box.innerHTML = "<b>请求失败：</b>" + esc(data.error || "未知错误");
+    return;
+  }
+  renderReport(data.report);
+}
+
+document.getElementById("btnAudit").addEventListener("click", submitAudit);
+document.getElementById("btnExampleEq").addEventListener("click", () => loadExample("eq"));
+document.getElementById("btnExampleNeq").addEventListener("click", () => loadExample("neq"));
+loadExample("eq");
+</script>
+</body>
+</html>
